@@ -334,12 +334,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // AppendEntries RPC
 // 需要同步的term和entry
 // commitIndex：告诉follower何时安全commit
-// nextIndex：一致性检测，使log entry同步
 type AppendEntriesArgs struct {
 	Term         int
 	LeaderId     int
-	PrevLogIndex int     // follower与leader最后一个相同entry index
-	PrevLogTerm  int     // 最后一个相同的Term
+	PrevLogIndex int     // 探测logIndex，直到follower和leader的logIndex相同，PreLogIndex = logIndex+1
+	PrevLogTerm  int     // 探测logTerm，直到follower和leader的logTerm相同，PreLogTerm = logTerm
 	Entries      []Entry // 要同步的entries
 	LeaderCommit int
 }
@@ -374,27 +373,33 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.setHeartBeatCh()
 		rf.convertToFollower(args.Term, args.LeaderId)
 
+		// 先探测args.PrevLogIndex再探测args.PrevLogTerm
 		// 若follower当前log index小于args.PrevLogIndex
-		// 说明follower缺少数据，需要再次同步
+		// args.PrevLogIndex继续向前探测
 		// reply更新ConflictIndex
-		// ConflictTerm留到后面比较，暂时不知道，置为-1
+		// ConflictTerm不需要改变，置为-1
 		if len(rf.log) < args.PrevLogIndex {
 			reply.Term = rf.currentTerm
 			reply.Success = false
 			reply.ConflictIndex = len(rf.log)
 			reply.ConflictTerm = -1
-		} else { // len(rf.log) >= args.PrevLogIndex
+		} else {
+			// len(rf.log) >= args.PrevLogIndex，可以根据logIndex求得logTerm，且恒有args.PrevLogTerm >= preLogTerm
+			// 因此考虑args.PrevLogTerm == preLogTerm和args.PrevLogTerm > preLogTerm
 			prevLogTerm := 0
 			if args.PrevLogIndex > 0 {
-				prevLogTerm = rf.log[args.PrevLogIndex-1].Term //preLogTerm为leader和follower相同(args.PrevLogIndex-1)的entry的Term
+				// args.PrevLogIndex为切片的开区间结尾，因此要比较(args.PrevLogIndex-1)的Term
+				prevLogTerm = rf.log[args.PrevLogIndex-1].Term
 			}
-			//若follower和leader的preLogIndex不相等，则找到相等的Term和该Term下第二个entryIndex
 			if args.PrevLogTerm != prevLogTerm {
 				reply.Term = rf.currentTerm
 				reply.Success = false
 				reply.ConflictTerm = prevLogTerm
+				// 我的实现是顺序找到第一个相等Term的Entry，忽略了后面相等的Entry，这意味着增加了同步复制的数量
+				// 可以优化
 				for i := 0; i < len(rf.log); i++ {
 					if rf.log[i].Term == prevLogTerm {
+						// 时刻注意无论是PrevLogIndex还是ConflictIndex都是开区间的结尾
 						reply.ConflictIndex = i + 1
 						break
 					}
@@ -402,7 +407,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			} else { // en(rf.log) >= args.PrevLogIndex && args.PrevLogTerm == prevLogTerm
 				reply.Term = rf.currentTerm
 				reply.Success = true
-				rf.log = append(rf.log[:args.PrevLogIndex], args.Entries...)
+				rf.log = append(rf.log[:args.PrevLogIndex], args.Entries...) // 切片是不包括args.PrevLogIndex
 				//告诉follower安全的commitIndex
 				if args.LeaderCommit > rf.commitIndex {
 					rf.commitIndex = args.LeaderCommit
@@ -509,6 +514,11 @@ type Entry struct {
 // tester or service expects Raft to send ApplyMsg messages.
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
+// 用于Server或Tester想要创建Raft服务器。
+// 所有Raft服务器（包括该Raft服务器）的端口都位于peers[]中。
+// 该服务器的端口是peers [me]。 所有服务器的peers []数组的顺序相同。
+// persister是该服务器保存其持久状态的位置，并且最初还保存最近保存的状态（如果有）。
+// applyCh是Tester或Server期望Raft发送ApplyMsg消息的通道。
 // Make()必须快速返回，因此对于任何长时间运行的工作，它都应启动goroutines。
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
