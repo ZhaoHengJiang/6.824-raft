@@ -97,18 +97,20 @@ func (rf *Raft) GetState() (int, bool) {
 }
 
 // 状态转移函数
-// 转变成follower的根据就是手里有票投，或已投出去票但自己没票
-// 需要根据candidate更新term
-func (rf *Raft) convertToFollower(term int, voteFor int) {
+// 转变成follower后更新term和votedFor，并且以下机制能保持每个peer都会在最新Term
+// 情况1：通信后发现对方比自己更新（无论收方还是发方，无论什么状态）
+// 情况2：candidate/follower监测到心跳，follower再次调用convertToFollower()是为了更新Term
+func (rf *Raft) convertToFollower(term int, votedFor int) {
 	rf.currentTerm = term
 	rf.state = Follower
 	rf.totalVotes = 0
-	rf.votedFor = voteFor
+	rf.votedFor = votedFor
 	rf.persist()
 }
 
-// AppendEntries RPC timeout后转变成candidate
-// 增加自己的任期，手中已有自己的一票
+// 增加自己的Term，手中已有自己的一票
+// 情况1：长时间没监测到心跳，参与竞选。无论electionTimeout还是RPCTimeout，都需要调用来更新Term
+// 情况2：leaderTimeout要开始重新选举
 func (rf *Raft) convertToCandidate() {
 	rf.state = Candidate
 	rf.currentTerm++
@@ -121,7 +123,8 @@ func (rf *Raft) convertToCandidate() {
 
 // 成为leader后需要记录follower的nextIndex和matchIndex
 // 初始化nextIndex[]数组，nextIndex[i]初始化为自己log entry的下一个位置
-// matchIndex初始化为0
+// matchIndex[]初始化为0
+// 情况：得到大多数选票
 func (rf *Raft) convertToLeader() {
 	rf.state = Leader
 	rf.nextIndex = make([]int, len(rf.peers))
@@ -772,28 +775,10 @@ func (rf *Raft) startAppendEntries() {
 							rf.mu.Unlock()
 							return
 						} else {
-							// 优化逻辑
-							// 最终要满足 rf.nextIndex[ii] = reply.ConflictIndex && rf.nextIndex[ii].Term = reply.ConflictTerm
-							//
-							//hasTermEuqalConflictTerm := false
-							//for i := 0; i < len(rf.log); i++ {
 							if rf.nextIndex[ii] < 1 {
 								rf.nextIndex[ii] = 1
 							} else {
 								rf.nextIndex[ii] = reply.ConflictIndex
-							}
-							//	if rf.log[i].Term > reply.ConflictTerm { //多余的判断，但方便理解
-							// if hasTermEuqalConflictTerm {
-							//	rf.nextIndex[ii] = 0
-							// } else {
-							//	rf.nextIndex[ii] = reply.ConflictIndex
-							// }
-							//break
-							//	}
-							//}
-							//rf.nextIndex[ii] --
-							if rf.nextIndex[ii] < 1 {
-								rf.nextIndex[ii] = 1
 							}
 							rf.mu.Unlock()
 						}
