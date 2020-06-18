@@ -120,7 +120,7 @@ func (rf *Raft) convertToCandidate() {
 }
 
 // 成为leader后需要记录follower的nextIndex和matchIndex
-// 且nextIndex初始化为自己log entry的下一个位置
+// 初始化nextIndex[]数组，nextIndex[i]初始化为自己log entry的下一个位置
 // matchIndex初始化为0
 func (rf *Raft) convertToLeader() {
 	rf.state = Leader
@@ -528,6 +528,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	// 初始化Raft{}
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.log = []Entry{}
@@ -544,28 +545,40 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.timer = time.NewTimer(time.Duration(rf.electionTimeout) * time.Millisecond)
 
 	// initialize from state persisted before a crash
+	// 恢复persistent state
 	rf.readPersist(persister.ReadRaftState())
 	DPrintf("--------------------- Resume server %d persistent state ---------------------\n", rf.me)
 	go func() {
 		for {
+			// 但凡修改rf结构体的都要加锁
 			rf.mu.Lock()
 			state := rf.state
 			rf.mu.Unlock()
+			// 状态机选择
 			switch {
 			case state == Leader:
+				// 发送AppendEntries RPC并定时进入下一次for循环，相当于心跳检测
 				DPrintf("Candidate %d: l become leader now!!! Current term is %d\n", rf.me, rf.currentTerm)
 				rf.startAppendEntries()
 			case state == Candidate:
+				// 发送Vote RPC，接着等待选票
+				// 用到select语句，哪个Channel先来数据则先执行哪个Channel，否则阻塞等待
 				DPrintf("================ Candidate %d start election!!! ================\n", rf.me)
 				go rf.startRequestVote()
 				select {
 				case <-rf.heartBeatCh:
+					// 收到来自leader发来的心跳检测，说明选举失败，转为follower
 					DPrintf("Candidate %d: receive heartbeat when requesting votes, turn back to follower\n", rf.me)
 					rf.mu.Lock()
 					rf.convertToFollower(rf.currentTerm, -1)
 					rf.mu.Unlock()
 				case <-rf.leaderCh:
+					// 成为leader
+					DPrintf("Candidate %d: receive a majority of server vote, win the election\n", rf.me)
 				case <-rf.timer.C:
+					// 选举超时，判断自己的状态，
+					// 若已转为follower则直接进入下轮循环，
+					// 若依然是candidate则调用convertToCandidate()刷新手中的选票和竞选超时时间
 					rf.mu.Lock()
 					if rf.state == Follower {
 						DPrintf("Candidate %d: existing a higher term candidate, withdraw from the election\n", rf.me)
@@ -576,6 +589,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					rf.mu.Unlock()
 				}
 			case state == Follower:
+				// 清空上个Term的时间，并重新设定随机时间
+				// 进入select阻塞等待通道数据
 				rf.mu.Lock()
 				// 必须！比如之前是Leader, 重新连接后转为Follower, 此时rf.timer.C里其实已经有值了
 				rf.drainOldTimer()
@@ -584,10 +599,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				rf.mu.Unlock()
 				select {
 				case <-rf.grantVoteCh:
+					// 完成投票
 					DPrintf("Server %d: reset election time due to grantVote\n", rf.me)
 				case <-rf.heartBeatCh:
+					// 监测到心跳
 					DPrintf("Server %d: reset election time due to heartbeat\n", rf.me)
 				case <-rf.timer.C:
+					// 选举超时/一段时间没监测到心跳，开始新一轮选举并参加竞选
 					DPrintf("Server %d: election timeout, turn to candidate\n", rf.me)
 					rf.mu.Lock()
 					rf.convertToCandidate()
@@ -668,6 +686,8 @@ func (rf *Raft) startRequestVote() {
 	}
 }
 
+// 判断state是否依然为leader
+// for()--go func() 并发发送AppendEntries RPC，并接受和接收reply
 func (rf *Raft) startAppendEntries() {
 	for {
 		// 这里rf.state == leader的判断很有必要, 见FailAgree2B
@@ -686,6 +706,7 @@ func (rf *Raft) startAppendEntries() {
 				}
 
 				for {
+					// 因为并发接收reply，因此其他goroutine可能会修改状态，因此接收前需要判断状态，并在修改读取值前加锁
 					rf.mu.Lock()
 					if rf.state != Leader {
 						rf.mu.Unlock()
@@ -735,6 +756,9 @@ func (rf *Raft) startAppendEntries() {
 							rf.matchIndex[ii] = prevLogIndex + len(entries)
 							rf.nextIndex[ii] = rf.matchIndex[ii] + 1
 							// paper中Figure 8的情形, 这个实现很妙!
+							// 将matchIndex拷贝一份进行排序，
+							// N = copyMatchIndex[len(rf.peers)/2]代表过半数peer都有Entry = log[N]。
+							// 超过半数并且是在当前Term下则更新commitIndex
 							copyMatchIndex := make([]int, len(rf.peers))
 							copy(copyMatchIndex, rf.matchIndex)
 							copyMatchIndex[rf.me] = len(rf.log)
@@ -749,20 +773,24 @@ func (rf *Raft) startAppendEntries() {
 							return
 						} else {
 							// 优化逻辑
-							hasTermEuqalConflictTerm := false
-							for i := 0; i < len(rf.log); i++ {
-								if rf.log[i].Term == reply.ConflictTerm {
-									hasTermEuqalConflictTerm = true
-								}
-								if rf.log[i].Term > reply.ConflictTerm {
-									if hasTermEuqalConflictTerm {
-										rf.nextIndex[ii] = i
-									} else {
-										rf.nextIndex[ii] = reply.ConflictIndex
-									}
-									break
-								}
+							// 最终要满足 rf.nextIndex[ii] = reply.ConflictIndex && rf.nextIndex[ii].Term = reply.ConflictTerm
+							//
+							//hasTermEuqalConflictTerm := false
+							//for i := 0; i < len(rf.log); i++ {
+							if rf.nextIndex[ii] < 1 {
+								rf.nextIndex[ii] = 1
+							} else {
+								rf.nextIndex[ii] = reply.ConflictIndex
 							}
+							//	if rf.log[i].Term > reply.ConflictTerm { //多余的判断，但方便理解
+							// if hasTermEuqalConflictTerm {
+							//	rf.nextIndex[ii] = 0
+							// } else {
+							//	rf.nextIndex[ii] = reply.ConflictIndex
+							// }
+							//break
+							//	}
+							//}
 							//rf.nextIndex[ii] --
 							if rf.nextIndex[ii] < 1 {
 								rf.nextIndex[ii] = 1
